@@ -94,6 +94,7 @@
 
             
             <Button Content="Send"
+                Name="SendButton"
                 Click="OnSend"
                 Width="55" 
                 Background="#0E639C"

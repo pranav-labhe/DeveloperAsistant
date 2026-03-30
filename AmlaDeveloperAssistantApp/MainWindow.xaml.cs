@@ -22,6 +22,12 @@ using HtmlDocument = HtmlAgilityPack.HtmlDocument;
 
 namespace AmlaDeveloperAssistantApp
 {
+    class ChatMessage
+    {
+        public string Role { get; set; } // "user" / "assistant"
+        public string Content { get; set; }
+    }
+
     public partial class MainWindow : Window
     {
         private string projectRoot = @"D:\10x";
@@ -29,8 +35,19 @@ namespace AmlaDeveloperAssistantApp
         private readonly string repoVectorPath;
         private readonly string kbVectorPath;
 
-        private readonly HttpClient http = new HttpClient(); 
+        private readonly HttpClient http = new HttpClient()
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
         private CancellationTokenSource? _currentCts;
+        private bool _isProcessing = false;
+        private List<ChatMessage> _chatHistory = new();
+
+        private readonly string chatHistoryPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "AmlaDeveloperAssistant",
+            "chat_history.json"
+        );
 
         public MainWindow()
         {
@@ -50,11 +67,138 @@ namespace AmlaDeveloperAssistantApp
                 "kb_vectors.json"
             );
 
+            if (File.Exists(chatHistoryPath))
+            {
+                var json = File.ReadAllText(chatHistoryPath);
+                _chatHistory = JsonSerializer.Deserialize<List<ChatMessage>>(json) ?? new();
+            }
             // position bottom right
             var area = Screen.PrimaryScreen.WorkingArea;
             Left = area.Width - Width - 10;
             Top = area.Height - Height - 10;
+
+            // fire and forget (non-blocking)
+            var bubble = AddAiMessage("🔄 Initializing AI...");
+            var textBlock = (TextBlock)bubble.Child;
+
+            
+            WarmUpModels(textBlock);
+           
         }
+        private async Task WarmUpModels(TextBlock? uiText = null)
+        {
+            SendButton.IsEnabled = false;
+            QuestionBox.IsEnabled = false;
+            var olderForeground = SendButton.Foreground;
+            SendButton.Foreground = Brushes.BlueViolet;
+            if (uiText != null)
+            {
+                System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                {
+                    uiText.Text = "🔄 Warming up AI models...\nThis may take a moment, but it ensures faster responses later on.\n\n";
+
+                });
+            }
+            try
+            {
+                var textModels = new[]
+                {
+                "phi3",
+                "deepseek-coder:6.7b"
+            };
+
+                var embeddingModels = new[]
+                {
+                "nomic-embed-text"
+            };
+
+                // 🔹 Warm text models
+                foreach (var model in textModels)
+                {
+                    try
+                    {
+                        UpdateUI(uiText, $"\n⏳ Loading model: {model}...");
+
+                        var req = new
+                        {
+                            model = model,
+                            keep_alive = -1
+                        };
+
+                        await http.PostAsync(
+                            "http://localhost:11434/api/generate",
+                            new StringContent(JsonSerializer.Serialize(req), Encoding.UTF8, "application/json")
+                        );
+
+                        UpdateUI(uiText, $"\n✅ Model ready: {model}");
+                    }
+                    catch
+                    {
+                        UpdateUI(uiText, $"\n❌ Failed: {model}");
+                    }
+                }
+
+                // 🔹 Warm embedding models (IMPORTANT CHANGE)
+                foreach (var model in embeddingModels)
+                {
+                    try
+                    {
+                        UpdateUI(uiText, $"\n⏳ Loading embedding model: {model}...");
+
+                        var req = new
+                        {
+                            model = model,
+                            prompt = "warmup"
+                        };
+
+                        await http.PostAsync(
+                            "http://localhost:11434/api/embeddings",
+                            new StringContent(JsonSerializer.Serialize(req), Encoding.UTF8, "application/json")
+                        );
+
+                        UpdateUI(uiText, $"\n✅ Embedding model ready: {model}");
+                    }
+                    catch
+                    {
+                        UpdateUI(uiText, $"\n❌ Embedding failed: {model}");
+                    }
+                }
+
+                UpdateUI(uiText, "\n🚀 All models warmed up!");
+                UpdateUI(uiText, "\n\nYou can now ask your questions. Feel free to explore! 😊");
+            }
+            catch(Exception ex)
+            {
+                UpdateUI(uiText, "\n⚠️ Warm-up error: " + ex.Message);
+            }
+            finally
+            {
+                SendButton.IsEnabled = true;
+                QuestionBox.IsEnabled = true;
+                SendButton.Foreground = olderForeground;
+                QuestionBox.Focus();
+            }
+        }
+        private void UpdateUI(TextBlock? uiText, string message)
+        {
+            if (uiText == null) return;
+
+            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            {
+                uiText.Text += message + "\n";
+            });
+        }
+
+        private void SaveChatHistory()
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(chatHistoryPath)!);
+
+            File.WriteAllText(
+                chatHistoryPath,
+                JsonSerializer.Serialize(_chatHistory)
+            );
+        }
+
 
         class VectorChunk
         {
@@ -73,7 +217,7 @@ namespace AmlaDeveloperAssistantApp
         {
             var bubble = new Border
             {
-                Background =  Brushes.DodgerBlue,
+                Background = Brushes.DodgerBlue,
                 CornerRadius = new CornerRadius(10),
                 Padding = new Thickness(10),
                 Margin = new Thickness(60, 5, 5, 5),
@@ -120,34 +264,83 @@ namespace AmlaDeveloperAssistantApp
         // SEND QUESTION
         private async void OnSend(object sender, RoutedEventArgs e)
         {
+            if (_isProcessing)
+            {
+                try
+                {
+                    _currentCts?.Cancel();
+                }
+                catch { }
+
+                return;
+            }
+
             var question = QuestionBox.Text;
 
             if (string.IsNullOrWhiteSpace(question))
                 return;
 
-            AddUserMessage(question);
-
-            QuestionBox.Text = "";
-
-            var aiBubble = AddAiMessage("Thinking...");
-
-            bool isSimple = IsSimpleQuery(question);
-
-            // fallback to AI if uncertain
-            if (!isSimple && question.Length < 25)
+            // Disable UI
+            _isProcessing = true;
+            SetUiEnabled(false);
+            try
             {
-                isSimple = await IsSimpleQueryAI(question);
-            }
 
-            string context = "";
-            if (!isSimple)
-            {
-                context = await SearchVectors(question);
+                AddUserMessage(question);
+
+                QuestionBox.Text = "";
+
+                var aiBubble = AddAiMessage("Thinking...💭 ");
+
+                bool isSimple = IsSimpleQuery(question);
+
+                // fallback to AI if uncertain
+                if (!isSimple && question.Length < 25)
+                {
+                    isSimple = await IsSimpleQueryAI(question);
+                }
+
+                string context = "";
+                if (!isSimple)
+                {
+                    context = await SearchVectors(question);
+                }
+                var textBlock = (TextBlock)aiBubble.Child;
+                textBlock.Text = "⚡ Thinking deeper...🧠\n\n"; // clear "Thinking..."
+                await CallOllamaStreaming(question, context, isSimple, textBlock);
             }
-            var textBlock = (TextBlock)aiBubble.Child;
-            textBlock.Text = "⚡ Generating...\n\n"; // clear "Thinking..."
-            await CallOllamaStreaming(question, context, isSimple, textBlock);  
+            catch (Exception ex)
+            {
+                AddAiMessage("⚠️ Error: " + ex.Message);
+            }
+            finally
+            {
+                _isProcessing = false;
+                SetUiEnabled(true);
+                QuestionBox.Focus();
+            }
         }
+
+        private void SetUiEnabled(bool isEnabled, string buttontext = "")
+        { 
+            if (isEnabled)
+            { 
+                SendButton.Content = "Send";
+                SendButton.Width = 55; // auto
+            }
+            else
+            { 
+                SendButton.Content = "🛑 Stop Thinking..💭";
+                SendButton.Width = 110; // auto
+            }
+            if(!string.IsNullOrEmpty(buttontext))
+            {
+                SendButton.Content = buttontext;
+            }
+            QuestionBox.IsEnabled = isEnabled;
+            SendButton.IsEnabled = true; // ✅ IMPORTANT: keep button enabled always
+        }
+
         private bool IsSimpleQuery(string q)
         {
             if (string.IsNullOrWhiteSpace(q))
@@ -223,7 +416,8 @@ namespace AmlaDeveloperAssistantApp
 
                 return output == "GREETING";
             }
-            catch {
+            catch
+            {
                 return false;
             }
         }
@@ -268,7 +462,7 @@ namespace AmlaDeveloperAssistantApp
         private async void OnRefreshKB(object sender, RoutedEventArgs e)
         {
             var aiBubble = AddAiMessage("Indexing knowledge base...");
-            var textBlock = (TextBlock)aiBubble.Child; 
+            var textBlock = (TextBlock)aiBubble.Child;
             var vectors = await IndexKnowledgeBase(textBlock);
 
             Directory.CreateDirectory(Path.GetDirectoryName(kbVectorPath)!);
@@ -489,7 +683,7 @@ namespace AmlaDeveloperAssistantApp
                                     {
                                         System.Windows.Application.Current.Dispatcher.Invoke(() =>
                                         {
-                                            uiText.Text = " chunks processed : "+ result .Count + "\n source : "+ url;
+                                            uiText.Text = " chunks processed : " + result.Count + "\n source : " + url;
                                         });
                                     }
                                 }
@@ -638,7 +832,7 @@ namespace AmlaDeveloperAssistantApp
             foreach (var r in ranked)
             {
                 context.AppendLine("----");
-                context.AppendLine(r.Content); 
+                context.AppendLine(r.Content);
             }
 
             var final = context.ToString();
@@ -676,16 +870,41 @@ namespace AmlaDeveloperAssistantApp
 
             bool hasContext = !string.IsNullOrWhiteSpace(context);
 
+            var defaultrequest = new
+            {
+                model = modelToUse,
+                prompt = question,
+                stream = true
+            };
+            var request = new HttpRequestMessage(HttpMethod.Post, "http://localhost:11434/api/generate")
+            {
+                Content = new StringContent(
+                    JsonSerializer.Serialize(defaultrequest),
+                    Encoding.UTF8,
+                    "application/json"
+                )
+            };
             // 🔥 Decide model smartly
             if (isSimple || !hasContext)
             {
                 prompt = $@"
-You are a friendly assistant.
+                User: {question}
+                Assistant:";
 
-User: {question}
-Assistant:";
-
-                modelToUse = "phi3";
+                var reqWithoutContext = new
+                {
+                    model = modelToUse,
+                    prompt = prompt,
+                    stream = true
+                };
+                request = new HttpRequestMessage(HttpMethod.Post, "http://localhost:11434/api/generate")
+                {
+                    Content = new StringContent(
+                        JsonSerializer.Serialize(reqWithoutContext),
+                        Encoding.UTF8,
+                        "application/json"
+                    )
+                };
             }
             else
             {
@@ -694,50 +913,56 @@ Assistant:";
                 //    context = context.Substring(0, 2000);
 
                 prompt = $@"
-Answer using ONLY the context.
+                        Answer using ONLY the context.
 
-If not found, say: I don't know.
+                        If not found, say: I don't know.
 
-Context:
-{context}
+                        Context:
+                        {context}
 
-Question:
-{question}
+                        Question:
+                        {question}
 
-Answer:";
+                        Answer:";
 
                 // 🔥 Use DeepSeek only if context is meaningful
                 modelToUse = context.Length > 400 ? "deepseek-coder:6.7b" : "phi3";
-            }
 
-            var req = new
-            {
-                model = modelToUse,
-                prompt = prompt,
-                stream = true,
-                options = new
+                var reqWithContext = new
                 {
-                    temperature = 0.2,
-                    num_predict = 200 // 🔥 reduced from 300
-                }
-            };
-
-            try
-            {
-                _currentCts = new CancellationTokenSource(TimeSpan.FromMinutes(10));
-
-                var request = new HttpRequestMessage(HttpMethod.Post, "http://localhost:11434/api/generate")
+                    model = modelToUse,
+                    prompt = prompt,
+                    stream = true,
+                    options = new
+                    {
+                        temperature = 0.2,
+                        num_predict = 500 // 🔥 reduced from 300
+                    }
+                };
+                request = new HttpRequestMessage(HttpMethod.Post, "http://localhost:11434/api/generate")
                 {
                     Content = new StringContent(
-                        JsonSerializer.Serialize(req),
+                        JsonSerializer.Serialize(reqWithContext),
                         Encoding.UTF8,
                         "application/json"
                     )
                 };
+            }
+
+
+            try
+            {
+                _chatHistory.Add(new ChatMessage
+                {
+                    Role = "user",
+                    Content = question
+                });
+
+                _currentCts = new CancellationTokenSource(TimeSpan.FromMinutes(30));
 
                 var response = await http.SendAsync(
                     request,
-                    HttpCompletionOption.ResponseHeadersRead, 
+                    HttpCompletionOption.ResponseHeadersRead,
                     _currentCts.Token
                 );
 
@@ -753,31 +978,68 @@ Answer:";
 
                 var result = new StringBuilder();
 
+                int counter = 0;
+                SetUiEnabled(false, "📝 Generating..."); // ✅ ensure UI is enabled during streaming
                 while (!reader.EndOfStream)
                 {
-                    var line = await reader.ReadLineAsync().WaitAsync(_currentCts.Token);
+                    var line = await reader.ReadLineAsync(); // ✅ FIX 1 (remove WaitAsync)
 
                     if (string.IsNullOrWhiteSpace(line))
                         continue;
 
-                    var json = JsonDocument.Parse(line);
-
-                    if (json.RootElement.TryGetProperty("response", out var r))
+                    try
                     {
-                        var token = r.GetString();
+                        var json = JsonDocument.Parse(line);
 
-                        result.Append(token);
-
-                        // 🔥 LIVE STREAM TO UI (IMPORTANT)
-                        if (uiText != null)
+                        if (json.RootElement.TryGetProperty("response", out var r))
                         {
-                            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                            var token = r.GetString();
+
+                            if (string.IsNullOrEmpty(token))
+                                continue;
+
+                            result.Append(token);
+
+                            counter++;
+
+                            // 🔥 Throttle UI updates (VERY IMPORTANT)
+                            if (uiText != null && counter % 3 == 0)
                             {
-                                uiText.Text += token;
-                            });
+                                var textSnapshot = result.ToString();
+
+                                await System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
+                                {
+                                    uiText.Text = textSnapshot;
+                                }, System.Windows.Threading.DispatcherPriority.Background);
+                            }
                         }
                     }
+                    catch
+                    {
+                        // ignore bad chunks
+                    }
                 }
+                var finalText = result.ToString();
+                if(string.IsNullOrWhiteSpace(finalText))
+                {
+                    finalText = "⚠️ No answer generated. Try refining your question.";
+                }
+                if (uiText != null)
+                {
+
+                    await System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
+                    {
+                        uiText.Text = finalText;
+                    });
+                }
+                _chatHistory.Add(new ChatMessage
+                {
+                    Role = "assistant",
+                    Content = finalText
+                });
+
+                SaveChatHistory();
+
             }
             catch (OperationCanceledException)
             {
@@ -787,20 +1049,16 @@ Answer:";
                     {
                         uiText.Text = "⚠️ Request timed out. Try again or refine your question.";
                     });
-                } 
+                }
             }
             return string.Empty;
         }
 
-        private void OnStop(object sender, RoutedEventArgs e)
+        protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
         {
-            try
-            {
-                _currentCts?.Cancel(); 
-            }
-            catch
-            {               
-            }
+            e.Cancel = true;   // ❌ prevent close
+            this.Hide();       // 👈 hide instead
         }
+
     }
 }

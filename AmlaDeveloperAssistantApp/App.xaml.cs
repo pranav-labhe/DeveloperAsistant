@@ -10,36 +10,58 @@ namespace AmlaDeveloperAssistantApp
         private NotifyIcon trayIcon;
         private MainWindow window;
 
+        private static Mutex _mutex;
+
         protected override void OnStartup(StartupEventArgs e)
         {
+            // ✅ SINGLE INSTANCE CHECK
+            bool createdNew;
+            _mutex = new Mutex(true, "AmlaDeveloperAssistantApp", out createdNew);
+
+            if (!createdNew)
+            {
+                // App already running → exit this instance
+                Shutdown();
+                return;
+            }
+
             base.OnStartup(e);
 
             trayIcon = new NotifyIcon();
-            trayIcon.Icon = new Icon("app.ico"); // make sure file exists
+            trayIcon.Icon = new Icon("app.ico");
             trayIcon.Visible = true;
             trayIcon.Text = "Amla Developer Assistant";
 
             var menu = new ContextMenuStrip();
-
             menu.Items.Add("Open Assistant", null, OnOpen);
             menu.Items.Add("Exit", null, OnExit);
 
             trayIcon.ContextMenuStrip = menu;
-
             trayIcon.DoubleClick += OnOpen;
         }
 
         private void OnOpen(object sender, EventArgs e)
         {
-            if (window == null)
+            if (window == null || !window.IsLoaded)
             {
                 window = new MainWindow();
-                window.Closed += (s, args) => window = null;
+
+                window.Closed += (s, args) =>
+                {
+                    window = null;
+                };
+
                 window.Show();
             }
             else
             {
+                if (window.WindowState == WindowState.Minimized)
+                    window.WindowState = WindowState.Normal;
+
                 window.Activate();
+                window.Topmost = true;   // bring front
+                window.Topmost = false;  // reset
+                window.Focus();
             }
         }
 
@@ -47,6 +69,6 @@ namespace AmlaDeveloperAssistantApp
         {
             trayIcon.Visible = false;
             Shutdown();
-        }
+        } 
     }
 }
